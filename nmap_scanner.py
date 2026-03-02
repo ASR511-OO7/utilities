@@ -895,7 +895,7 @@ class NmapScanner:
 
 
 def read_ip_list(filename):
-    """Read IP addresses from file"""
+    """Read IPs and hostnames from file"""
     if not os.path.exists(filename):
         print(f"Error: File '{filename}' not found", file=sys.stderr)
         sys.exit(1)
@@ -905,9 +905,8 @@ def read_ip_list(filename):
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                # Basic IP validation
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', line):
-                    ips.append(line)
+                # Accept both IP addresses and standard hostnames
+                ips.append(line)
     
     return ips
 
@@ -921,7 +920,7 @@ def main():
     parser.add_argument(
         '-f', '--file',
         required=True,
-        help='Text file containing list of IP addresses (one per line)'
+        help='Text file containing list of IP addresses or hostnames (one per line)'
     )
     
     parser.add_argument(
@@ -958,7 +957,7 @@ def main():
             print(f"Error: Invalid thread count '{args.threads}'", file=sys.stderr)
             sys.exit(1)
     
-    print(f"Starting scan of {len(ip_list)} IP(s) with {threads if threads == 'all' else str(threads)} thread(s)...")
+    print(f"Starting scan of {len(ip_list)} target(s) with {threads if threads == 'all' else str(threads)} thread(s)...")
     print("Using nmap with -T4 timing and full port range (-p-)")
     if not args.no_pn:
         print("Auto-retry with -Pn if host appears down")
