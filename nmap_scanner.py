@@ -47,10 +47,8 @@ class NmapScanner:
         
         # Detailed scan tracking
         self.detailed_completed = 0
-        self.detailed_in_progress = 0
         self.detailed_total = 0
-        self.detailed_queue = Queue()  # Separate queue for detailed scans
-        self.detailed_workers_started = False
+        self.ports_to_scan = defaultdict(list)  # {port: [ip1, ip2, ...]}
         
         # Display throttling
         self.last_display_time = 0
@@ -129,23 +127,22 @@ class NmapScanner:
             
             lines.append("=" * 80)
             
-            # Phase 2 section (if any detailed scans are running)
+            # Phase 2 section (if any detailed scans are planned/running/done)
             if self.detailed_total > 0:
                 detailed_percentage = (self.detailed_completed / self.detailed_total * 100) if self.detailed_total > 0 else 0
                 lines.append("")
                 lines.append("=" * 80)
-                lines.append(f"PHASE 2 - DETAILED SCANNING (Services, Versions, Vulnerabilities)")
-                lines.append(f"PROGRESS: {self.detailed_completed} completed | {self.detailed_in_progress} in progress | {self.detailed_total} total ({detailed_percentage:.0f}%)")
+                lines.append(f"PHASE 2 - BULK PORT-SPECIFIC SCANS (Vulnerabilities, SSH, SSL)")
+                lines.append(f"PROGRESS: {self.detailed_completed} completed | {self.detailed_total} total ({detailed_percentage:.0f}%)")
                 lines.append("=" * 80)
                 
                 # Show detailed scan status
-                for ip in sorted(self.ip_list):
-                    if ip in self.detailed_results:
-                        lines.append(f"  {ip:15s} - Detailed scan complete")
-                    elif self.results.get(ip) and len(self.results[ip]) > 0:
-                        # Has ports but not yet scanned
-                        if ip in [item[0] for item in list(self.detailed_queue.queue)]:
-                            lines.append(f"  {ip:15s} - Queued for detailed scan")
+                for port, ips in sorted(self.ports_to_scan.items()):
+                    status = "Pending / Running"
+                    if self.detailed_completed > list(self.ports_to_scan.keys()).index(port):
+                        status = "Complete"
+                        
+                    lines.append(f"  Port {port:<5} ({len(ips)} hosts) - {status}")
                 
                 lines.append("=" * 80)
             
@@ -338,25 +335,47 @@ class NmapScanner:
             # Perform scan (status updates happen inside scan_ip)
             ports = self.scan_ip(ip)
             
+            detailed_out = ""
+            if ports and len(ports) > 0:
+                with self.lock:
+                    self.ip_status[ip] = 'Running detailed scan...'
+                self.display_results()
+                
+                # Instantly start detailed scan for this host 
+                detailed_out = self.detailed_scan(ip, ports)
+                
             # Update results
             with self.lock:
                 self.results[ip] = ports
+                if detailed_out:
+                    self.detailed_results[ip] = detailed_out
                 self.ip_status[ip] = 'Complete'
                 self.ip_progress[ip] = 100.0
                 self.in_progress -= 1
                 self.completed += 1
                 
-                # If this IP has open ports, queue it for detailed scan immediately
-                if ports and len(ports) > 0:
-                    self.detailed_queue.put((ip, ports))
-                    self.detailed_total += 1
-                    # Start detailed workers if not already started
-                    if not self.detailed_workers_started:
-                        self.detailed_workers_started = True
-                        self.start_detailed_workers()
-            
             self.display_results()
             self.queue.task_done()
+            
+    def detailed_scan(self, ip, ports):
+        """Perform normal detailed scan without vulnerability scripts per IP"""
+        port_list = ','.join(map(str, sorted(ports)))
+        cmd = [
+            'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
+            '-p', port_list,
+            '-oN', '-',
+            ip
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            output = f"\n--- DETAILED SCAN ---\n" + result.stdout
+            if result.stderr:
+                output += "\n=== STDERR ===\n" + result.stderr
+            return output
+        except subprocess.TimeoutExpired:
+            return f"\nDetailed scan timed out for {ip}\n"
+        except Exception as e:
+            return f"\nError during detailed scan of {ip}: {e}\n"
     
     def save_port_specific_results(self, port, script_name, ip, output):
         """Thread-safe append of port-specific script results to a common file"""
@@ -370,116 +389,85 @@ class NmapScanner:
                 f.write(output)
                 f.write("\n")
 
-    def detailed_scan(self, ip, ports):
-        """Perform detailed scan with service detection and vulnerability scanning per port"""
-        combined_output = ""
+    def run_bulk_port_specific_scans(self):
+        """Run Phase 2 bulk vulnerability scans grouping all IPs by port"""
+        # Distill which IPs have which ports open
+        for ip, ports in self.results.items():
+            if ports:
+                for port in ports:
+                    self.ports_to_scan[port].append(ip)
+                    
+        self.detailed_total = len(self.ports_to_scan)
         
-        for port in sorted(ports):
+        # Iteratively bulk-scan each unique port discovered across all applicable IPs
+        for port, ips in sorted(self.ports_to_scan.items()):
             port_str = str(port)
+            self.display_results()
+            
             try:
-                # 1. Run vuln script for this specific port
+                # 1. Run vuln script for this specific port across ALL target IPs simultaneously
                 cmd_vuln = [
                     'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
                     '--script', 'vuln',
                     '-p', port_str,
-                    '-oN', '-',  # Normal output to stdout
-                    ip
-                ]
+                    '-oN', '-',
+                ] + ips
                 
                 result_vuln = subprocess.run(
-                    cmd_vuln, capture_output=True, text=True, timeout=1800
+                    cmd_vuln, capture_output=True, text=True, timeout=3600
                 )
                 
-                out_vuln = f"\n--- VULN SCAN (Port {port}) ---\n" + result_vuln.stdout
+                out_vuln = f"\n--- BULK VULN SCAN (Port {port}) ---\n" + result_vuln.stdout
                 if result_vuln.stderr:
                     out_vuln += "\n=== STDERR ===\n" + result_vuln.stderr
-                combined_output += out_vuln + "\n"
                 
-                # Save just the vuln result for this port to a file
-                self.save_port_specific_results(port, "vuln", ip, out_vuln)
+                self.save_port_specific_results(port, "vuln", "BULK", out_vuln)
+                
+                # Distribute output back to individual IPs for HTML compilation
+                for ip in ips:
+                    with self.lock:
+                        if ip not in self.detailed_results:
+                            self.detailed_results[ip] = ""
+                        self.detailed_results[ip] += f"\n--- VULN SCAN (Port {port}) ---\n[Refer to output log: {self.output_prefix}_port_{port}_vuln.txt for full bulk details.]\n"
                 
                 # 2. Run protocol-specific scripts if applicable
-                if port == 22:
-                    cmd_ssh = [
-                        'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
-                        '--script', 'ssh*',
-                        '-p', port_str,
-                        '-oN', '-',
-                        ip
-                    ]
-                    result_ssh = subprocess.run(
-                        cmd_ssh, capture_output=True, text=True, timeout=1800
-                    )
-                    out_ssh = f"\n--- SSH SCAN (Port 22) ---\n" + result_ssh.stdout
-                    if result_ssh.stderr:
-                        out_ssh += "\n=== STDERR ===\n" + result_ssh.stderr
-                    combined_output += out_ssh + "\n"
-                    
-                    self.save_port_specific_results(port, "ssh*", ip, out_ssh)
-                    
-                elif port == 443:
-                    cmd_ssl = [
-                        'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
-                        '--script', 'ssl*',
-                        '-p', port_str,
-                        '-oN', '-',
-                        ip
-                    ]
-                    result_ssl = subprocess.run(
-                        cmd_ssl, capture_output=True, text=True, timeout=1800
-                    )
-                    out_ssl = f"\n--- SSL SCAN (Port 443) ---\n" + result_ssl.stdout
-                    if result_ssl.stderr:
-                        out_ssl += "\n=== STDERR ===\n" + result_ssl.stderr
-                    combined_output += out_ssl + "\n"
-                    
-                    self.save_port_specific_results(port, "ssl*", ip, out_ssl)
-                    
-            except subprocess.TimeoutExpired:
-                timeout_msg = f"\nDetailed scan timed out for {ip} on port {port}\n"
-                combined_output += timeout_msg
-                self.save_port_specific_results(port, "timeout", ip, timeout_msg)
-            except Exception as e:
-                err_msg = f"\nError during detailed scan of {ip} on port {port}: {e}\n"
-                combined_output += err_msg
-                self.save_port_specific_results(port, "error", ip, err_msg)
+                combined_specific = ""
+                script_name = ""
                 
-        return combined_output
-    
-    def detailed_scan_worker(self):
-        """Worker for detailed scanning phase"""
-        while True:
-            try:
-                item = self.detailed_queue.get(timeout=1)
-            except:
-                break
+                if port == 22:
+                    script_name = "ssh*"
+                elif port == 443:
+                    script_name = "ssl*"
+                    
+                if script_name:
+                    cmd_spec = [
+                        'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
+                        f'--script={script_name}',
+                        '-p', port_str,
+                        '-oN', '-',
+                    ] + ips
+                    
+                    result_spec = subprocess.run(
+                        cmd_spec, capture_output=True, text=True, timeout=3600
+                    )
+                    
+                    out_spec = f"\n--- BULK {script_name.upper()} SCAN (Port {port}) ---\n" + result_spec.stdout
+                    if result_spec.stderr:
+                        out_spec += "\n=== STDERR ===\n" + result_spec.stderr
+                        
+                    self.save_port_specific_results(port, script_name, "BULK", out_spec)
+                    
+                    # Distribute specific log notifications
+                    for ip in ips:
+                        with self.lock:
+                            self.detailed_results[ip] += f"\n--- {script_name.upper()} SCAN (Port {port}) ---\n[Refer to output log: {self.output_prefix}_port_{port}_{script_name.replace('*', '_all')}.txt for full bulk details.]\n"
+                            
+            except Exception as e:
+                err_msg = f"\nError during bulk scan of port {port}: {e}\n"
+                self.save_port_specific_results(port, "error", "BULK", err_msg)
             
-            ip, ports = item
-            
-            # Update in_progress count
             with self.lock:
-                self.detailed_in_progress += 1
-            
-            self.display_results()
-            
-            # Perform detailed scan
-            detailed_output = self.detailed_scan(ip, ports)
-            
-            # Print detailed results to terminal
-            print("\n" + "=" * 80)
-            print(f"DETAILED SCAN RESULTS FOR {ip}")
-            print("=" * 80)
-            print(detailed_output)
-            print("=" * 80 + "\n")
-            
-            # Update results
-            with self.lock:
-                self.detailed_results[ip] = detailed_output
-                self.detailed_in_progress -= 1
                 self.detailed_completed += 1
-            
-            self.display_results()
-            self.detailed_queue.task_done()
     
     def save_text_report(self):
         """Save IP and ports to text file"""
@@ -497,14 +485,6 @@ class NmapScanner:
                     f.write(f"{ip} : No open ports found\n")
         
         return filename
-    
-    def start_detailed_workers(self):
-        """Start detailed scan worker threads"""
-        num_threads = min(self.threads, 3)  # Limit detailed scans to 3 concurrent
-        
-        for _ in range(num_threads):
-            t = threading.Thread(target=self.detailed_scan_worker, daemon=True)
-            t.start()
     
     def generate_html_report(self):
         """Generate HTML report with collapsible sections"""
@@ -878,10 +858,8 @@ class NmapScanner:
         text_file = self.save_text_report()
         print(f"\n\n✓ Port scan results saved to: {text_file}\n")
         
-        # Wait for all detailed scans to complete (if any were started)
-        if self.detailed_total > 0:
-            print(f"\nWaiting for {self.detailed_total} detailed scan(s) to complete...\n")
-            self.detailed_queue.join()
+        # Execute Bulk Phase 2 Scans
+        self.run_bulk_port_specific_scans()
         
         # Final display
         self.display_results()
