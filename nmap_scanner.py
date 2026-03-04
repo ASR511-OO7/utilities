@@ -15,7 +15,7 @@ from queue import Queue
 import time
 from datetime import datetime
 import html
-
+import json
 
 class NmapScanner:
     def __init__(self, ip_list, threads, output_prefix="nmap_scan", no_pn=False):
@@ -31,19 +31,28 @@ class NmapScanner:
         self.output_dir = f"{self.output_prefix}_results"
         os.makedirs(self.output_dir, exist_ok=True)
         
+        # Session state file path
+        self.session_file = os.path.join(self.output_dir, f"{self.output_prefix}_session.json")
+        
+        # Core data dictionaries
         self.results = {}  # {ip: [ports]}
         self.ip_status = {}  # {ip: status_message}
         self.ip_progress = {}  # {ip: progress_percentage}
         self.detailed_results = {}  # {ip: nmap_output}
-        self.completed = 0
+        
+        # Attempt to load previous session
+        self._load_session()
+        
+        self.completed = sum(1 for ip in ip_list if self.ip_status.get(ip) == 'Complete')
         self.in_progress = 0
         self.total = len(ip_list)
         
-        # Initialize all IPs as not started
+        # Initialize incomplete IPs as Pending
         for ip in ip_list:
-            self.results[ip] = None
-            self.ip_status[ip] = 'Pending...'
-            self.ip_progress[ip] = 0.0
+            if ip not in self.results:
+                self.results[ip] = None
+                self.ip_status[ip] = 'Pending...'
+                self.ip_progress[ip] = 0.0
         
         # Detailed scan tracking
         self.detailed_completed = 0
@@ -55,14 +64,58 @@ class NmapScanner:
         self.display_interval = 0.2  # Update display max every 0.2 seconds
         self.display_lines = 0  # Track number of lines in last display
         
-        # Queue for IPs to scan
+        # Queue for unskipped IPs to scan
         self.queue = Queue()
         for ip in ip_list:
-            self.queue.put(ip)
+            if self.ip_status.get(ip) != 'Complete':
+                self.queue.put(ip)
             
         # Background thread for real-time HTML updates
         self.html_thread = threading.Thread(target=self.html_report_loop, daemon=True)
         self.html_thread.start()
+        
+    def _load_session(self):
+        """Load session state if a previous run was interrupted"""
+        if os.path.exists(self.session_file):
+            try:
+                with open(self.session_file, 'r') as f:
+                    state = json.load(f)
+                    
+                # Load valid completed host data into dictionaries
+                for ip, data in state.items():
+                    if ip in self.ip_list:
+                        self.results[ip] = data.get("ports", None)
+                        if data.get("detailed_out"):
+                            self.detailed_results[ip] = data.get("detailed_out")
+                        self.ip_status[ip] = 'Complete'
+                        self.ip_progress[ip] = 100.0
+            except Exception as e:
+                print(f"Warning: Could not load session file: {e}", file=sys.stderr)
+                
+    def _save_session(self):
+        """Thread-safe snapshot of currently completed scan values"""
+        state = {}
+        with self.lock:
+            for ip, ports in self.results.items():
+                if self.ip_status.get(ip) == 'Complete':
+                    state[ip] = {
+                        "ports": ports,
+                        "detailed_out": self.detailed_results.get(ip, "")
+                    }
+        
+        try:
+            with open(self.session_file, 'w') as f:
+                json.dump(state, f, indent=4)
+        except Exception:
+            pass
+            
+    def _cleanup_session(self):
+        """Removes the session tracking file upon complete execution"""
+        if os.path.exists(self.session_file):
+            try:
+                os.remove(self.session_file)
+            except Exception:
+                pass
         
     def html_report_loop(self):
         """Periodically generate HTML report in real-time"""
@@ -343,8 +396,15 @@ class NmapScanner:
                 
                 # Instantly start detailed scan for this host 
                 detailed_out = self.detailed_scan(ip, ports)
+            
+            # Append detailed scan output directly under the port discovery results
+            if detailed_out:
+                phase1_file = os.path.join(self.output_dir, f"{self.output_prefix}_{ip}_phase1.txt")
+                with self.lock:
+                    with open(phase1_file, 'a', encoding='utf-8') as f:
+                        f.write(detailed_out)
                 
-            # Update results
+            # Update results and log progress
             with self.lock:
                 self.results[ip] = ports
                 if detailed_out:
@@ -354,6 +414,7 @@ class NmapScanner:
                 self.in_progress -= 1
                 self.completed += 1
                 
+            self._save_session()
             self.display_results()
             self.queue.task_done()
             
@@ -361,7 +422,8 @@ class NmapScanner:
         """Perform normal detailed scan without vulnerability scripts per IP"""
         port_list = ','.join(map(str, sorted(ports)))
         cmd = [
-            'nmap', '-Pn', '-n', '-v', '-sV', '-sC', '-sT',
+            'nmap', '-Pn', '-n', '-v', '-T3', '-sV', '-sC', '-sT',
+            '--script', 'vuln',
             '-p', port_list,
             '-oN', '-',
             ip
@@ -861,6 +923,9 @@ class NmapScanner:
         # Execute Bulk Phase 2 Scans
         self.run_bulk_port_specific_scans()
         
+        # Cleanup session file as everything has completed flawlessly
+        self._cleanup_session()
+        
         # Final display
         self.display_results()
         
@@ -942,11 +1007,16 @@ def main():
     else:
         print("-Pn auto-retry DISABLED")
     print()
+    print("Session tracking ENABLED. You can safely interrupt (Ctrl+C) and resume the command later.")
     time.sleep(2)
     
     # Run scanner
-    scanner = NmapScanner(ip_list, threads, no_pn=args.no_pn)
-    results = scanner.run()
+    try:
+        scanner = NmapScanner(ip_list, threads, no_pn=args.no_pn)
+        results = scanner.run()
+    except KeyboardInterrupt:
+        print("\n\n[!!] SCAN INTERRUPTED: Progress saved. Run the same command again to resume.")
+        sys.exit(0)
     
     print("\n\nScan Complete!")
     print(f"\nTotal IPs scanned: {len(results)}")
